@@ -1,0 +1,136 @@
+clear; clc; close all;
+
+%% 参数设置（仅此处修改了 Lx、Ly，其他保持不变）
+Lx = 1.0; 
+Ly = 0.5;
+
+Nx = 440; 
+Ny = 82;
+
+dx = Lx/(Nx-1); 
+dy = Ly/(Ny-1);
+
+x = linspace(0, Lx, Nx); 
+y = linspace(0, Ly, Ny);
+[X, Y] = meshgrid(x, y);
+
+% 圆柱参数与几何（保持不变，圆柱位置与半径未改动）
+cx = 0.2; 
+cy = Ly/2; 
+r  = 0.05;
+cylinder = ((X - cx).^2 + (Y - cy).^2) <= r^2;
+
+% 物性与时间步（保持不变）
+U_inf = 1.0; 
+rho   = 1.0;
+Re    = 500; 
+D     = 2*r;
+nu    = U_inf * D / Re;
+
+dt = 1e-4;
+nt = 500000;
+
+gif_interval  = 100;
+save_interval = 1000;  % 每多少步保存一次
+
+% 初始条件（保持不变）
+u = U_inf * ones(Ny, Nx);
+v = zeros(Ny, Nx);
+p = zeros(Ny, Nx);
+u(cylinder) = 0; 
+v(cylinder) = 0;
+
+% GIF 文件名（保持不变；本脚本未绘制 GIF，仅占位）
+gif_u_file     = 'u_velocity.gif';
+gif_v_file     = 'v_velocity.gif';
+gif_p_file     = 'pressure.gif';
+gif_speed_file = 'speed_magnitude.gif';
+
+% 如果结果文件存在，先删除旧文件
+if isfile('cylinder_flow_result.mat')
+    delete('cylinder_flow_result.mat');
+end
+
+%% 主循环
+for t = 1:nt
+    un = u; vn = v; pn = p;
+
+    % 一阶导数（中心差分）
+    du_dx = (un(:,[2:end end]) - un(:,[1 1:end-1]))/(2*dx);
+    du_dy = (un([2:end end],:) - un([1 1:end-1],:))/(2*dy);
+    dv_dx = (vn(:,[2:end end]) - vn(:,[1 1:end-1]))/(2*dx);
+    dv_dy = (vn([2:end end],:) - vn([1 1:end-1],:))/(2*dy);
+
+    % 二阶导数（中心差分）
+    d2u_dx2 = (un(:,[2:end end]) - 2*un + un(:,[1 1:end-1]))/dx^2;
+    d2u_dy2 = (un([2:end end],:) - 2*un + un([1 1:end-1],:))/dy^2;
+    d2v_dx2 = (vn(:,[2:end end]) - 2*vn + vn(:,[1 1:end-1]))/dx^2;
+    d2v_dy2 = (vn([2:end end],:) - 2*vn + vn([1 1:end-1],:))/dy^2;
+
+    % 预测速度
+    u_star = un + dt*(nu*(d2u_dx2 + d2u_dy2) - un.*du_dx - vn.*du_dy);
+    v_star = vn + dt*(nu*(d2v_dx2 + d2v_dy2) - un.*dv_dx - vn.*dv_dy);
+
+    % 计算压力泊松方程右端项
+    div_u_star = (u_star(:,[2:end end]) - u_star(:,[1 1:end-1]))/(2*dx) + ...
+                 (v_star([2:end end],:) - v_star([1 1:end-1],:))/(2*dy);
+    rhs = (rho/dt) * div_u_star;
+
+    % 迭代解压力（简单的雅可比/高斯赛德尔样式）
+    for k = 1:100
+        pn_old = p;
+        p(2:end-1,2:end-1) = ( ...
+            (p(2:end-1,3:end) + p(2:end-1,1:end-2))*dy^2 + ...
+            (p(3:end,2:end-1) + p(1:end-2,2:end-1))*dx^2 - ...
+            rhs(2:end-1,2:end-1)*dx^2*dy^2 ) / (2*(dx^2 + dy^2));
+
+        % 边界条件（保持不变）
+        p(:,end) = 0;        % 出口压强
+        p(:,1)   = p(:,2);   % 入口 Neumann
+        p(1,:)   = p(2,:);   % 下边界 Neumann
+        p(end,:) = p(end-1,:); % 上边界 Neumann
+
+        if max(abs(p(:) - pn_old(:))) < 1e-4
+            break;
+        end
+    end
+
+    % 校正速度
+    u(2:end-1,2:end-1) = u_star(2:end-1,2:end-1) - dt/rho*(p(2:end-1,3:end) - p(2:end-1,1:end-2))/(2*dx);
+    v(2:end-1,2:end-1) = v_star(2:end-1,2:end-1) - dt/rho*(p(3:end,2:end-1) - p(1:end-2,2:end-1))/(2*dy);
+
+    % 速度边界条件（保持不变）
+    u(:,1) = U_inf; v(:,1) = 0;             % 入口
+    u(:,end) = u(:,end-1); v(:,end) = v(:,end-1); % 出口 Neumann
+    u(1,:) = 0; u(end,:) = 0; v(1,:) = 0; v(end,:) = 0; % 上下壁面无滑移
+    u(cylinder) = 0; v(cylinder) = 0;       % 圆柱无滑移
+
+    % === 分段保存数据 ===
+    if mod(t, save_interval) == 0 || t == nt
+        time_val = t * dt;
+        x_col = X(:); 
+        y_col = Y(:);
+        u_col = u(:); 
+        v_col = v(:);
+        s_col = sqrt(u_col.^2 + v_col.^2);
+        p_col = p(:);
+        t_col = time_val * ones(size(x_col));
+        result_block = [t_col, x_col, y_col, u_col, v_col, s_col, p_col];
+
+        if exist('cylinder_flow_result.mat', 'file')
+            load('cylinder_flow_result.mat', 'result_matrix_all');
+            result_matrix_all = [result_matrix_all; result_block];
+        else
+            result_matrix_all = result_block;
+        end
+        save('cylinder_flow_result.mat', 'result_matrix_all', '-v7.3');
+    end
+
+    % === GIF 绘图（如需可在此处加入你原来的绘图逻辑）===
+
+end
+
+disp('✅ 仿真完成，数据分段保存成功到 cylinder_flow_result.mat');
+
+% 如需快速查看新网格，可取消下面注释：
+% figure; plot(X, Y, '.'); axis equal tight; title('New grid with Lx=1, Ly=0.5');

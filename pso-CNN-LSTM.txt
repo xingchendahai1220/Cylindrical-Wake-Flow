@@ -1,0 +1,412 @@
+# -*- coding: utf-8 -*-
+import os, math, json, random, warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import h5py
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+# ================== 基本参数 ==================
+MAT_PATH   = 'cylinder_flow_result.mat'    # v7.3 .mat, 列: [t,x,y,u,v,s,p]
+TARGET_T   = 50.0                          # 预测 50 s
+TRAIN_T0   = 10.0                          # 训练起始时间（含）
+TRAIN_T1   = 50.0                          # 训练结束时间（不含）
+T_IN       = 5                              # 输入序列长度（帧）
+BATCH_SIZE = 4
+MAX_EPOCHS = 30
+VAL_RATIO  = 0.1
+SEED       = 42
+DEVICE     = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# ---- PSO 搜索空间（轻量配置，保持原样） ----
+N_PARTICLES = 6
+PSO_ITERS   = 4
+LR_RANGE    = (1e-4, 5e-3)
+ENC_CHOICE  = [8, 12, 16]
+LSTM_HID_CH = [32, 64, 96]
+WEIGHT_DECAY= (0.0, 1e-4)
+
+# ================== 误差色轴（仅作用于误差图） ==================
+ERR_USE_FIXED_U = True
+ERR_U_RANGE     = (-0.05, 0.05)   # u 误差图固定范围（零居中）
+
+ERR_USE_FIXED_V = True
+ERR_V_RANGE     = (-0.05, 0.05)   # v 误差图固定范围（零居中）
+# =====================================================================
+
+# 出图风格
+plt.rcParams.update({
+    'font.family': 'Times New Roman',
+    'font.size': 8,
+    'figure.dpi': 600,
+    'savefig.dpi': 600,
+    'pdf.fonttype': 42,
+    'ps.fonttype': 42
+})
+
+def cm2inch(w, h): return (w/2.54, h/2.54)
+def set_seed(s=SEED):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+set_seed()
+
+def nearest(sel_arr, target):
+    idx = np.argmin(np.abs(sel_arr - target))
+    return sel_arr[idx]
+
+# =============== 读取与网格重建 ===============
+with h5py.File(MAT_PATH, 'r') as f:
+    if 'result_matrix_all' not in f:
+        raise RuntimeError('未找到变量 result_matrix_all')
+    M = np.array(f['result_matrix_all'])
+if M.shape[1] != 7 and M.shape[0] == 7:
+    M = M.T
+if M.shape[1] != 7:
+    raise RuntimeError(f'期望 7 列 (t,x,y,u,v,s,p)，但得到 {M.shape}')
+
+t_all = M[:,0]; x_all = M[:,1]; y_all = M[:,2]
+u_all = M[:,3]; v_all = M[:,4]
+t_unique = np.unique(t_all)
+
+def rebuild_one_snapshot(field_all, t_sel):
+    mask = (t_all == t_sel)
+    x = x_all[mask]; y = y_all[mask]; f = field_all[mask]
+    xu, yu = np.unique(x), np.unique(y)
+    nx, ny = len(xu), len(yu)
+    order = np.lexsort((x, y))  # 先 y 后 x
+    F = f[order].reshape(ny, nx)
+    extent = [xu.min(), xu.max(), yu.min(), yu.max()]
+    return F, xu, yu, extent
+
+F0u, xu, yu, extent = rebuild_one_snapshot(u_all, t_unique[0])
+ny, nx = F0u.shape
+
+def build_cube(field_all):
+    cube = np.zeros((len(t_unique), ny, nx), dtype=np.float32)
+    for i, tt in enumerate(t_unique):
+        mask = (t_all == tt)
+        x = x_all[mask]; y = y_all[mask]; f = field_all[mask]
+        order = np.lexsort((x, y))
+        cube[i] = f[order].reshape(ny, nx)
+    return cube
+
+cube_u = build_cube(u_all)
+cube_v = build_cube(v_all)
+
+# 选择训练样本：用 T_IN 帧预测下一帧（t1 不包含 50s）
+def build_windows(cube, t_arr, t0=TRAIN_T0, t1=TRAIN_T1, t_in=T_IN):
+    idx_valid = np.where((t_arr >= t0) & (t_arr < t1))[0]
+    X_list, Y_list = [], []
+    for i in idx_valid:
+        j = i + 1
+        if i - (t_in - 1) < 0 or j >= len(t_arr):
+            continue
+        if t_arr[j] >= t1:
+            continue
+        X = cube[i - (t_in - 1): i + 1]  # (T_in, ny, nx)
+        Y = cube[j]                      # (ny, nx)
+        X_list.append(X); Y_list.append(Y)
+    X_arr = np.stack(X_list, axis=0) if X_list else np.empty((0,t_in,ny,nx))
+    Y_arr = np.stack(Y_list, axis=0) if Y_list else np.empty((0,ny,nx))
+    return X_arr, Y_arr
+
+X_u, Y_u = build_windows(cube_u, t_unique)
+X_v, Y_v = build_windows(cube_v, t_unique)
+if len(X_u) == 0 or len(X_v) == 0:
+    raise RuntimeError("训练样本为空：请检查时间范围与保存步长。")
+
+# =============== 数据集与归一化 ===============
+class FlowDS(Dataset):
+    def __init__(self, X, Y, mean=None, std=None):
+        if mean is None or std is None:
+            m = X.mean(); s = X.std(); s = 1.0 if s < 1e-8 else s
+        else:
+            m, s = mean, std
+        self.X = (X - m)/s
+        self.Y = (Y - m)/s
+        self.mean, self.std = m, s
+    def __len__(self): return self.X.shape[0]
+    def __getitem__(self, idx):
+        x = self.X[idx][None, ...]       # (1, T_in, ny, nx)
+        y = self.Y[idx][None, ...]       # (1, ny, nx)
+        return torch.from_numpy(x).float(), torch.from_numpy(y).float()
+
+ds_u = FlowDS(X_u, Y_u)
+ds_v = FlowDS(X_v, Y_v)
+
+def split_ds(ds, val_ratio=VAL_RATIO):
+    n = len(ds); n_val = max(1, int(n*val_ratio))
+    n_tr  = n - n_val
+    return random_split(ds, [n_tr, n_val], generator=torch.Generator().manual_seed(SEED))
+
+train_u, val_u = split_ds(ds_u)
+train_v, val_v = split_ds(ds_v)
+
+# =============== 模型：CNN-Encoder → LSTM → CNN-Decoder ===============
+class CNNEncoder(nn.Module):
+    def __init__(self, in_ch=1, base_ch=12):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, base_ch, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(base_ch, base_ch, 3, padding=1), nn.ReLU(inplace=True),
+            nn.AvgPool2d(2),
+            nn.Conv2d(base_ch, base_ch, 3, padding=1), nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class CNNDecoder(nn.Module):
+    def __init__(self, base_ch=12, out_ch=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(base_ch, base_ch, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(base_ch, out_ch, 1)
+        )
+    def forward(self, f):
+        return self.net(f)
+
+class CNN_LSTM(nn.Module):
+    def __init__(self, base_ch=12, lstm_hidden=64, ny=ny, nx=nx):
+        super().__init__()
+        self.enc = CNNEncoder(1, base_ch)
+        with torch.no_grad():
+            _tmp = torch.zeros(1,1,ny,nx)
+            f = self.enc(_tmp)
+            _, Cb, Hy, Hx = f.shape
+        self.Cb, self.Hy, self.Hx = Cb, Hy, Hx
+        self.flat_dim = Cb*Hy*Hx
+        self.lstm = nn.LSTM(input_size=self.flat_dim, hidden_size=lstm_hidden, num_layers=1, batch_first=True)
+        self.fc   = nn.Linear(lstm_hidden, self.flat_dim)
+        self.dec  = CNNDecoder(base_ch=Cb, out_ch=1)
+    def forward(self, x_seq):
+        B, C, T, H, W = x_seq.shape
+        feats = []
+        for t in range(T):
+            f = self.enc(x_seq[:, :, t, :, :])        # (B, Cb, Hy, Hx)
+            feats.append(f.reshape(B, -1))
+        F = torch.stack(feats, dim=1)                 # (B, T_in, flat_dim)
+        out, _ = self.lstm(F)
+        z = self.fc(out[:, -1, :]).reshape(B, self.Cb, self.Hy, self.Hx)
+        y = self.dec(z)                               # (B, 1, ny, nx)
+        return y
+
+# =============== 训练与评估 ===============
+def train_one(model, train_loader, val_loader, lr=1e-3, weight_decay=0.0, max_epochs=MAX_EPOCHS):
+    model = model.to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.MSELoss()
+    best = {'val': np.inf, 'state': None}
+    for ep in range(max_epochs):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+        model.eval(); val_loss = 0.0; nval = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                pred = model(xb)
+                val_loss += loss_fn(pred, yb).item()*xb.size(0)
+                nval += xb.size(0)
+        val_loss /= max(1,nval)
+        if val_loss < best['val']:
+            best['val'] = val_loss
+            best['state'] = {k:v.cpu().clone() for k,v in model.state_dict().items()}
+    model.load_state_dict(best['state'])
+    return model, best['val']
+
+def make_loaders(ds, batch_size=BATCH_SIZE):
+    train_ds, val_ds = ds
+    return (DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False),
+            DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False))
+
+# =============== PSO（与原脚本相同逻辑） ===============
+def pso_search(train_pair, base_field='u'):
+    train_loader, val_loader = make_loaders(train_pair)
+    def rnd():
+        return np.array([
+            np.random.uniform(np.log10(LR_RANGE[0]), np.log10(LR_RANGE[1])),
+            np.random.uniform(0, len(ENC_CHOICE)-1),
+            np.random.uniform(0, len(LSTM_HID_CH)-1),
+            np.random.uniform(np.log10(WEIGHT_DECAY[0]+1e-12), np.log10(WEIGHT_DECAY[1]+1e-12))
+        ], dtype=np.float32)
+    particles = [rnd() for _ in range(N_PARTICLES)]
+    vels      = [np.zeros_like(p) for p in particles]
+    pbest_x   = [p.copy() for p in particles]
+    pbest_f   = [np.inf]*N_PARTICLES
+    gbest_x   = particles[0].copy()
+    gbest_f   = np.inf
+
+    w, c1, c2 = 0.6, 1.2, 1.2
+    for it in range(PSO_ITERS):
+        for i,p in enumerate(particles):
+            lr  = 10**float(p[0])
+            enc = ENC_CHOICE[int(round(float(p[1])) % len(ENC_CHOICE))]
+            lstm= LSTM_HID_CH[int(round(float(p[2])) % len(LSTM_HID_CH))]
+            wd  = 10**float(p[3]); wd = 0.0 if WEIGHT_DECAY[0]==0.0 and wd<1e-8 else wd
+
+            model = CNN_LSTM(base_ch=enc, lstm_hidden=lstm, ny=ny, nx=nx)
+            model, val_loss = train_one(model, train_loader, val_loader,
+                                        lr=lr, weight_decay=wd, max_epochs=MAX_EPOCHS)
+
+            if val_loss < pbest_f[i]:
+                pbest_f[i] = val_loss; pbest_x[i] = p.copy()
+            if val_loss < gbest_f:
+                gbest_f = val_loss; gbest_x = p.copy()
+
+            print(f"[{base_field}] PSO iter {it+1}/{PSO_ITERS} particle {i+1}/{N_PARTICLES} | "
+                  f"lr={lr:.2e}, enc={enc}, lstm={lstm}, wd={wd:.1e} -> val={val_loss:.4e}")
+
+        for i in range(N_PARTICLES):
+            r1, r2 = np.random.rand(4), np.random.rand(4)
+            vels[i] = w*vels[i] + c1*r1*(pbest_x[i]-particles[i]) + c2*r2*(gbest_x-particles[i])
+            particles[i] += vels[i]
+
+    lr  = 10**float(gbest_x[0])
+    enc = ENC_CHOICE[int(round(float(gbest_x[1])) % len(ENC_CHOICE))]
+    lstm= LSTM_HID_CH[int(round(float(gbest_x[2])) % len(LSTM_HID_CH))]
+    wd  = 10**float(gbest_x[3]); wd = 0.0 if WEIGHT_DECAY[0]==0.0 and wd<1e-8 else wd
+    print(f"[{base_field}] Best: lr={lr:.2e}, enc={enc}, lstm={lstm}, wd={wd:.1e}")
+
+    model = CNN_LSTM(base_ch=enc, lstm_hidden=lstm, ny=ny, nx=nx).to(DEVICE)
+    train_loader, val_loader = make_loaders(train_pair)
+    model, _ = train_one(model, train_loader, val_loader, lr=lr, weight_decay=wd, max_epochs=MAX_EPOCHS)
+    return model
+
+# 训练 u 与 v
+model_u = pso_search((train_u, val_u), base_field='u')
+model_v = pso_search((train_v, val_v), base_field='v')
+
+# =============== 预测 50 s 的 u、v ===============
+def build_input_sequence(cube, t_arr, target=TARGET_T, t_in=T_IN):
+    dt = np.median(np.diff(t_arr))
+    frames = []
+    for k in range(t_in, 0, -1):
+        t_need = target - k*dt
+        t_sel = nearest(t_arr, t_need)
+        frames.append(cube[np.where(t_arr==t_sel)[0][0]])
+    X = np.stack(frames, axis=0)  # (T_in, ny, nx)
+    return X
+
+X50_u = build_input_sequence(cube_u, t_unique, TARGET_T, T_IN)
+X50_v = build_input_sequence(cube_v, t_unique, TARGET_T, T_IN)
+
+mu_u, su_u = ds_u.mean, ds_u.std
+mu_v, su_v = ds_v.mean, ds_v.std
+
+def predict_with_model(model, X_seq, mu, su):
+    x = ((X_seq - mu)/su)[None, None, ...]           # (1,1,T_in,ny,nx)
+    with torch.no_grad():
+        y = model(torch.from_numpy(x).float().to(DEVICE)).cpu().numpy()[0,0]
+    y = y*su + mu
+    return y
+
+pred_u_50 = predict_with_model(model_u, X50_u, mu_u, su_u)
+pred_v_50 = predict_with_model(model_v, X50_v, mu_v, su_v)
+
+t50 = nearest(t_unique, TARGET_T)
+u_50, _, _, _ = rebuild_one_snapshot(u_all, t50)
+v_50, _, _, _ = rebuild_one_snapshot(v_all, t50)
+
+err_u = pred_u_50 - u_50
+err_v = pred_v_50 - v_50
+
+# =============== 出图（原、预测、误差） ===============
+def imshow_center(F, extent, out_png, fixed_range=None):
+    if fixed_range is None:
+        vals = F[np.isfinite(F)]
+        if vals.size==0: vmin,vmax=-1.0,1.0
+        else:
+            p1,p99 = np.percentile(vals,[1,99]); A = max(abs(p1),abs(p99))+1e-12
+            vmin, vmax = -A, A
+    else:
+        vmin, vmax = fixed_range
+    fig = plt.figure(figsize=cm2inch(16.0, 6.8)); ax = plt.gca()
+    im = ax.imshow(F, origin='lower', extent=extent, aspect='equal',
+                   cmap='coolwarm', norm=TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax),
+                   interpolation='bilinear')
+    ax.set_axis_off()
+    cbar = fig.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.02)
+    cbar.set_ticks([vmin, vmax]); cbar.set_ticklabels([f'{vmin:.3g}', f'{vmax:.3g}'])
+    fig.subplots_adjust(0,0,1,1)
+    fig.savefig(out_png, bbox_inches='tight', pad_inches=0); plt.close(fig)
+
+def sym_range(*arrays):
+    vals = np.concatenate([a.ravel() for a in arrays if a is not None])
+    vals = vals[np.isfinite(vals)]
+    if vals.size==0: return (-1,1)
+    p1,p99 = np.percentile(vals,[1,99]); A=max(abs(p1),abs(p99))+1e-12
+    return (-A,A)
+
+# —— 原图与预测图：各自统一范围 ——
+u_range = sym_range(u_50, pred_u_50)
+v_range = sym_range(v_50, pred_v_50)
+
+imshow_center(u_50,      extent, 'u_true_50s.png',  fixed_range=u_range)
+imshow_center(pred_u_50, extent, 'u_pred_50s.png',  fixed_range=u_range)
+imshow_center(v_50,      extent, 'v_true_50s.png',  fixed_range=v_range)
+imshow_center(pred_v_50, extent, 'v_pred_50s.png',  fixed_range=v_range)
+
+# —— 误差图：自定义误差色轴 ——
+err_u_range = ERR_U_RANGE if ERR_USE_FIXED_U else sym_range(err_u)
+err_v_range = ERR_V_RANGE if ERR_USE_FIXED_V else sym_range(err_v)
+imshow_center(err_u, extent, 'u_err_50s.png', fixed_range=err_u_range)
+imshow_center(err_v, extent, 'v_err_50s.png', fixed_range=err_v_range)
+
+print("✅ 已导出图：u_true_50s.png, u_pred_50s.png, u_err_50s.png, v_true_50s.png, v_pred_50s.png, v_err_50s.png")
+
+# =============== 三条 y 线上导出所有 x 的原始/预测（Excel） ===============
+y_vals = [yu.min() + 0.25*(yu.max()-yu.min()),
+          yu.min() + 0.50*(yu.max()-yu.min()),
+          yu.min() + 0.75*(yu.max()-yu.min())]
+y_idx  = [np.argmin(np.abs(yu - yv)) for yv in y_vals]
+
+records = []
+for tag, yi in zip(['y25','y50','y75'], y_idx):
+    xs = xu.copy()
+    rec = pd.DataFrame({
+        'line': tag,
+        'x': xs,
+        'y': yu[yi],
+        'u_true': u_50[yi, :],
+        'u_pred': pred_u_50[yi, :],
+        'v_true': v_50[yi, :],
+        'v_pred': pred_v_50[yi, :]
+    })
+    records.append(rec)
+
+df_lines = pd.concat(records, axis=0, ignore_index=True)
+df_lines.to_excel('pred_lines.xlsx', index=False)
+print("✅ 已导出 Excel：pred_lines.xlsx（三条 y 线上所有 x 的 u/v 原始与预测）")
+
+# =============== 新增：全局相对 L2 误差（窗口展示 + 保存） ===============
+def relative_L2(pred, truth):
+    num = np.linalg.norm((pred - truth).ravel(), ord=2)
+    den = np.linalg.norm(truth.ravel(), ord=2) + 1e-20
+    return float(num/den)
+
+relL2_u = relative_L2(pred_u_50, u_50)
+relL2_v = relative_L2(pred_v_50, v_50)
+
+# 控制台输出
+print(f"📊 Global Relative L2 Error @ 50s ->  u: {relL2_u:.3e} , v: {relL2_v:.3e}")
+
+# 窗口展示（独立文本面板）并保存
+fig = plt.figure(figsize=cm2inch(10.0, 6.0))
+ax  = fig.add_subplot(111)
+ax.axis('off')
+txt = (f"Global Relative L2 Error @ t = {TARGET_T:.2f} s\n"
+       f"u-field: {relL2_u:.3e}\n"
+       f"v-field: {relL2_v:.3e}")
+ax.text(0.05, 0.7, txt, fontsize=10, va='top', ha='left')
+fig.tight_layout()
+fig.savefig('relL2_global.png', bbox_inches='tight', pad_inches=0)
+plt.show()  # 在窗口显示
